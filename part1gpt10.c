@@ -50,7 +50,7 @@ long vm_area_map(struct exec_context *current, u64 addr, int length, int prot, i
         prev = dummy;
         for (iter = dummy->vm_next; iter; prev = iter, iter = iter->vm_next)
         {
-            /* <-- here’s the only change: skip dummy’s 4 KB page */
+            /* skip over the dummy’s reserved 4 KB page */
             u64 hole_start = (prev == dummy)
                 ? (dummy->vm_start + PAGE_SIZE)
                 : prev->vm_end;
@@ -107,151 +107,177 @@ long vm_area_map(struct exec_context *current, u64 addr, int length, int prot, i
     return (long)start;
 }
 
-/** Part1 - 2nd Function --- munmap system call implementation ***/
+/** Part1 - 2nd Function --- munmap system call implementation ***********/
 long vm_area_unmap(struct exec_context *current, u64 addr, int length)
 {
     if (length <= 0) return -EINVAL;
     u64 len   = align_length(length);
     u64 start = addr;
     u64 end   = addr + len;
-    struct vm_area *dummy = current->vm_area, *prev = dummy, *iter = dummy->vm_next;
- 
+    u64 *pgd_tbl = (u64*)osmap(current->pgd);                                       /* 0) Free any already-mapped physical pages in [start,end) */
+    for (u64 va = start; va < end; va += PAGE_SIZE) 
+    {
+        u64 ent;                                                                     /* walk 4-level page table */
+        u64 *pud_tbl, *pmd_tbl, *pte_tbl;
+
+        ent = pgd_tbl[PGD_INDEX(va)];
+        if (!(ent & PTE_PRESENT)) continue;
+        pud_tbl = (u64*)osmap(ent >> PAGE_SHIFT);
+
+        ent = pud_tbl[PUD_INDEX(va)];
+        if (!(ent & PTE_PRESENT)) continue;
+        pmd_tbl = (u64*)osmap(ent >> PAGE_SHIFT);
+
+        ent = pmd_tbl[PMD_INDEX(va)];
+        if (!(ent & PTE_PRESENT)) continue;
+        pte_tbl = (u64*)osmap(ent >> PAGE_SHIFT);
+
+        ent = pte_tbl[PTE_INDEX(va)];
+        if (!(ent & PTE_PRESENT)) continue;
+
+        os_pfn_free(USER_REG, (u32)(ent >> PAGE_SHIFT));                                      /* free and clear */
+        pte_tbl[PTE_INDEX(va)] = 0;
+    }
+
+    struct vm_area *dummy = current->vm_area, *prev = dummy, *iter = dummy->vm_next;                /* 1) Now do your existing VMA unmap logic exactly as before */
     while (iter)
     {
-        if (!range_overlap(start, end, iter->vm_start, iter->vm_end))
+        if (!range_overlap(start, end, iter->vm_start, iter->vm_end)) 
         {
-            prev = iter;
-            iter = iter->vm_next;
+            prev = iter; iter = iter->vm_next;
             continue;
         }
-
         u64 ov_s = start > iter->vm_start ? start : iter->vm_start;
-        u64 ov_e = end < iter->vm_end ? end : iter->vm_end;
-        
-        if (ov_s <= iter->vm_start && ov_e >= iter->vm_end)                     // Fully covered 
-        {
+        u64 ov_e = end   < iter->vm_end   ? end   : iter->vm_end;
+
+        if (ov_s <= iter->vm_start && ov_e >= iter->vm_end)             // fully covered
+        {     
             prev->vm_next = iter->vm_next;
-            os_free(iter, sizeof(*iter));
+            os_free(iter, sizeof(*iter));                           /* stats-- if you still track them */
             iter = prev->vm_next;
         }
-        
-        else if (ov_s <= iter->vm_start)                                        // Overlap at beginning
-        {
+        else if (ov_s <= iter->vm_start)                            // trim front
+        {                        
             iter->vm_start = ov_e;
-            prev = iter;
-            iter = iter->vm_next;
+            prev = iter; iter = iter->vm_next;
         }
-        
-        else if (ov_e >= iter->vm_end)                                          // Overlap at end
-        {
+        else if (ov_e >= iter->vm_end)                                  // trim back
+        {                          
             iter->vm_end = ov_s;
-            prev = iter;
-            iter = iter->vm_next;
+            prev = iter; iter = iter->vm_next;
         }
-        
-        else                                                                    // Split interior
-        {
+        else                                                       // split interior
+        {                                                   
             struct vm_area *new_vma = os_alloc(sizeof(*new_vma));
             if (!new_vma) return -ENOMEM;
             new_vma->vm_start = ov_e;
-            new_vma->vm_end = iter->vm_end;
+            new_vma->vm_end   = iter->vm_end;
             new_vma->access_flags = iter->access_flags;
-            new_vma->vm_next = iter->vm_next;
-            iter->vm_end = ov_s;
-            iter->vm_next = new_vma;
-            prev = new_vma;
-            iter = new_vma->vm_next;
+            new_vma->vm_next  = iter->vm_next;
+            iter->vm_end      = ov_s;
+            iter->vm_next     = new_vma;                            /* stats += 1 if you track them */
+            prev = new_vma; iter = new_vma->vm_next;
         }
     }
     return 0;
 }
 
-/** Part1 - 3rd Function --- mprotect System call implementation ***/
+/**  Part1 - 3rd Function  mprotect System call implementation **************/
 long vm_area_mprotect(struct exec_context *current, u64 addr, int length, int prot)
 {
     if (length <= 0) return -EINVAL;
-    if (prot != PROT_READ && prot != (PROT_READ | PROT_WRITE)) return -EINVAL;
-
+    if (prot != PROT_READ && prot != (PROT_READ|PROT_WRITE)) return -EINVAL;
     u64 len   = align_length(length);
     u64 start = addr;
     u64 end   = addr + len;
-    struct vm_area *dummy = current->vm_area, *prev = dummy, *iter = dummy->vm_next;
 
+    u64 *pgd_tbl = (u64*)osmap(current->pgd);                                       /* 0) Update any already-mapped pages’ PTEs to reflect new prot */
+    for (u64 va = start; va < end; va += PAGE_SIZE) 
+    {
+        u64 ent;
+        u64 *pud_tbl, *pmd_tbl, *pte_tbl;
+
+        ent = pgd_tbl[PGD_INDEX(va)];
+        if (!(ent & PTE_PRESENT)) continue;
+        pud_tbl = (u64*)osmap(ent >> PAGE_SHIFT);
+
+        ent = pud_tbl[PUD_INDEX(va)];
+        if (!(ent & PTE_PRESENT)) continue;
+        pmd_tbl = (u64*)osmap(ent >> PAGE_SHIFT);
+
+        ent = pmd_tbl[PMD_INDEX(va)];
+        if (!(ent & PTE_PRESENT)) continue;
+        pte_tbl = (u64*)osmap(ent >> PAGE_SHIFT);
+
+        ent = pte_tbl[PTE_INDEX(va)];
+        if (!(ent & PTE_PRESENT)) continue;
+
+        u32 pfn = (u32)(ent >> PAGE_SHIFT);                                         /* rebuild leaf */
+        u64 flags = PTE_PRESENT | PTE_USER | ((prot == (PROT_READ|PROT_WRITE)) ? PTE_RW : 0);
+        pte_tbl[PTE_INDEX(va)] = (pfn << PAGE_SHIFT) | flags;
+    }
+
+    struct vm_area *dummy = current->vm_area, *prev = dummy, *iter = dummy->vm_next;                        /* 1) Now do your existing VMA mprotect logic exactly as before */
     while (iter)
     {
         if (!range_overlap(start, end, iter->vm_start, iter->vm_end))
         {
-            prev = iter;
-            iter = iter->vm_next;
+            prev = iter; iter = iter->vm_next;
             continue;
         }
-
         u64 ov_s = start > iter->vm_start ? start : iter->vm_start;
-        u64 ov_e = end < iter->vm_end ? end : iter->vm_end;
+        u64 ov_e = end   < iter->vm_end   ? end   : iter->vm_end;
 
-        if (ov_s <= iter->vm_start && ov_e >= iter->vm_end)                             // Fully covered: change flags
+        if (ov_s <= iter->vm_start && ov_e >= iter->vm_end)                          // fully covered
         {
             iter->access_flags = prot;
-            prev = iter;
-            iter = iter->vm_next;
+            prev = iter; iter = iter->vm_next;
         }
-
-        else if (ov_s <= iter->vm_start)                                                // Overlap at beginning
+        else if (ov_s <= iter->vm_start)                                            // split front 
         {
             struct vm_area *post = os_alloc(sizeof(*post));
             if (!post) return -ENOMEM;
-            
             post->vm_start = ov_e;
-            post->vm_end = iter->vm_end;
+            post->vm_end   = iter->vm_end;
             post->access_flags = iter->access_flags;
-            post->vm_next = iter->vm_next;
-            iter->vm_end = ov_e;
+            post->vm_next  = iter->vm_next;
+            iter->vm_end   = ov_e;
             iter->access_flags = prot;
-            iter->vm_next = post;
-            prev = post;
-            iter = post->vm_next;
+            iter->vm_next  = post;                                                   /* stats++ if tracked */
+            prev = post; iter = post->vm_next;
         }
-
-        else if (ov_e >= iter->vm_end)                                                  // Overlap at end
-        {
+        else if (ov_e >= iter->vm_end)                                               // split back
+        {   
             struct vm_area *pre = os_alloc(sizeof(*pre));
             if (!pre) return -ENOMEM;
-            
             pre->vm_start = iter->vm_start;
-            pre->vm_end = ov_s;
+            pre->vm_end   = ov_s;
             pre->access_flags = iter->access_flags;
-            pre->vm_next = iter->vm_next;
+            pre->vm_next  = iter->vm_next;
             iter->vm_start = ov_s;
             iter->access_flags = prot;
-            iter->vm_next = pre;
-            prev->vm_next = iter;
-            prev = pre;
-            iter = pre->vm_next;
+            iter->vm_next  = pre;                                                                   /* stats++ if tracked */
+            prev = pre; iter = pre->vm_next;
         }
-
-        else                                                                            // Interior split
-        {
+        else                                                         // interior split
+        {                                               
             struct vm_area *post = os_alloc(sizeof(*post));
             if (!post) return -ENOMEM;
-
             post->vm_start = ov_e;
-            post->vm_end = iter->vm_end;
+            post->vm_end   = iter->vm_end;
             post->access_flags = iter->access_flags;
-            post->vm_next = iter->vm_next;
+            post->vm_next  = iter->vm_next;
 
             struct vm_area *mid = os_alloc(sizeof(*mid));
             if (!mid) return -ENOMEM;
-
-            mid->vm_start = ov_s;
-            mid->vm_end = ov_e;
+            mid->vm_start  = ov_s;
+            mid->vm_end    = ov_e;
             mid->access_flags = prot;
-            mid->vm_next = post;
-            u64 orig_start = iter->vm_start;
-            iter->vm_start = orig_start;
-            iter->vm_end = ov_s;
-            iter->vm_next = mid;
-            prev = post;
-            iter = post->vm_next;
+            mid->vm_next   = post;
+
+            iter->vm_end   = ov_s;
+            iter->vm_next  = mid;                           /* stats += 2 if tracked */
+            prev = post; iter = post->vm_next;
         }
     }
     return 0;
