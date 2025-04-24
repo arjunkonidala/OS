@@ -17,6 +17,11 @@
 #define PTE_SHIFT    12
 #define PTRS_PER_PT  512ULL
 
+#define PAGE_SHIFT    12    /* number of bits to shift to get page offset */
+#define USER_REG      0            /* region index for user pages */
+#define OS_PT_REG     1            /* region index for OS page‐table pages */
+
+
 /* Page‑fault error codes from assignment */
 #define ERR_CODE_READ    0x4
 #define ERR_CODE_WRITE   0x6
@@ -177,6 +182,20 @@ long vm_area_mprotect(struct exec_context *current, u64 addr, int length, int pr
 long vm_area_map(struct exec_context *current, u64 addr, int length, int prot, int flags)
 {
     struct vm_area *head = current->vm_area;
+    if(head==0){
+        
+        
+        struct vm_area* x=os_alloc(sizeof(struct vm_area));
+        x->vm_start=MMAP_AREA_START;
+        x->vm_end=MMAP_AREA_START+4096;
+        x->vm_next=head;
+        x->access_flags=0x0;
+        head=x;
+        current->vm_area = x;
+        stats->num_vm_area = 1;
+        
+    }
+
     struct vm_area *prev, *iter;
     u64 length_aligned = align_length(length);
     u64 start = 0;
@@ -347,7 +366,14 @@ long vm_area_unmap(struct exec_context *current, u64 addr, int length)
     return 0;
 }
 
-
+// long vm_area_pagefault(struct exec_context *current, u64 addr, int error_code)
+// {   
+//     return -1;
+// }
+long vm_area_pagefault(struct exec_context *current, u64 addr, int error_code)
+{
+    return -1;
+}
 
 
 
@@ -357,73 +383,6 @@ long vm_area_unmap(struct exec_context *current, u64 addr, int length)
  * created using mmap
  */
 
- long vm_area_pagefault(struct exec_context *current, u64 addr, int error_code)
- {
-//     return -1;
-// }
- 
-// long vm_area_pagefault(struct exec_context *current, u64 addr, int error_code)
-// {
-//     u64 fault_va = addr & ~(PAGE_SIZE - 1);
-//     struct vm_area *vma = current->vm_area->vm_next;
-//     int is_write = (error_code == ERR_CODE_WRITE || error_code == ERR_CODE_PROT);
-
-//     /* 1. Find the VMA for this address */
-//     while (vma) {
-//         if (fault_va >= vma->vm_start && fault_va < vma->vm_end)
-//             break;
-//         vma = vma->vm_next;
-//     }
-//     if (!vma)
-//         return -1;           /* no VMA => invalid access */
-
-//     /* 2. Protection check */
-//     if (is_write && !(vma->access_flags & PROT_WRITE)) {
-//         /* write to read‑only */
-//         if (error_code == ERR_CODE_PROT)
-//             return handle_cow_fault(current, fault_va, vma->access_flags);
-//         return -1;
-//     }
-
-//     /* 3. Lazy allocation: allocate a new physical frame */
-//     u32 new_pfn = os_pfn_alloc(USER_REG);
-//     if (!new_pfn)
-//         return -ENOMEM;
-
-//     /* 4. Walk the 4‑level page table, allocating intermediate tables as needed */
-//     u64 *pgd = (u64 *)osmap(current->pgd);
-//     u64 *table = pgd;
-//     for (int level = 0; level < 4; level++) {
-//         int shift = (level==0? PGD_SHIFT : level==1? PUD_SHIFT :
-//                      level==2? PMD_SHIFT : PTE_SHIFT);
-//         u64 idx = va_to_index(fault_va, shift);
-//         u64 ent = table[idx];
-
-//         if (level < 3) {
-//             /* not yet at leaf: ensure the next‑level table exists */
-//             if (!(ent & PTE_P)) {
-//                 u32 pfn = os_pfn_alloc(OS_PT_REG);
-//                 if (!pfn) {
-//                     os_pfn_free(USER_REG, new_pfn);
-//                     return -ENOMEM;
-//                 }
-//                 /* zero it out */
-//                 memset(osmap(pfn), 0, PAGE_SIZE);
-//                 table[idx] = (pfn << PTE_SHIFT) | PTE_P | PTE_W | PTE_U;
-//             }
-//             /* descend */
-//             table = (u64 *)osmap((table[idx] >> PTE_SHIFT));
-//         } else {
-//             /* leaf PTE: map our new frame with VMA’s prot flags */
-//             u64 flags = PTE_P | PTE_U
-//                       | ((vma->access_flags & PROT_WRITE) ? PTE_W : 0);
-//             table[idx] = (new_pfn << PTE_SHIFT) | flags;
-//         }
-//     }
-
-//     return 1;  /* success */
-// 
-}
 
 
  /**
