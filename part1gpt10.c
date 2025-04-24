@@ -1,73 +1,119 @@
-/**************************************** PART2 ********************************************/
-/* Page-Table Manipulations: lazy alloc, munmap, mprotect */
+/* ------------------------------------------------------------------------- */
+/* Paging constants & helpers (no <string.h> needed)                        */
+#define PAGE_SHIFT   12                  /* 4 KB pages */
+#define PAGE_SIZE    (1ULL << PAGE_SHIFT)
+#define PTRS_PER_PT  512ULL
+
+#define PGD_SHIFT    39
+#define PUD_SHIFT    30
+#define PMD_SHIFT    21
+#define PTE_SHIFT    12
+
+#define PGD_INDEX(x) (((x) >> PGD_SHIFT) & (PTRS_PER_PT - 1))
+#define PUD_INDEX(x) (((x) >> PUD_SHIFT) & (PTRS_PER_PT - 1))
+#define PMD_INDEX(x) (((x) >> PMD_SHIFT) & (PTRS_PER_PT - 1))
+#define PTE_INDEX(x) (((x) >> PTE_SHIFT) & (PTRS_PER_PT - 1))
+
+#ifndef OS_PT_REG
+#define OS_PT_REG    0    /* region for page-table pages */
+#endif
+#ifndef USER_REG
+#define USER_REG     1    /* region for user data pages */
+#endif
+
+#define PTE_PRESENT  (1ULL << 0)
+#define PTE_RW       (1ULL << 1)
+#define PTE_USER     (1ULL << 2)
+
+/* Round up to next page multiple */
+static u64 align_length(u64 len) {
+    return ((len + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE;
+}
+/* simple overlap test */
+static int range_overlap(u64 s1, u64 e1, u64 s2, u64 e2) {
+    return (s1 < e2 && s2 < e1);
+}
+/* ------------------------------------------------------------------------- */
 
 /**
- * Part2.1 – Lazy-allocate page-fault handler.
+ * Part 2.1: page‐fault handler for lazy allocation in mmap’d VMAs.
  */
 long vm_area_pagefault(struct exec_context *current, u64 addr, int error_code)
 {
-    u64 fault_va = addr & ~(PAGE_SIZE - 1);
-    struct vm_area *vma;
-    int is_write   = (error_code == ERR_CODE_WRITE || error_code == ERR_CODE_PROT);
-    int is_present = (error_code != ERR_CODE_READ);
+    /* 1) Find the covering VMA */
+    u64 fault_va = addr & ~(PAGE_SIZE-1);
+    struct vm_area *vma = current->vm_area->vm_next;
+    while (vma && (fault_va < vma->vm_start || fault_va >= vma->vm_end))
+        vma = vma->vm_next;
+    if (!vma) 
+        return -1;                /* no VMA ⇒ invalid access */
 
-    /* 1) Find VMA covering fault_va */
-    for (vma = current->vm_area->vm_next; vma; vma = vma->vm_next) {
-        if (fault_va >= vma->vm_start && fault_va < vma->vm_end)
-            break;
-    }
-    if (!vma) return -1;  /* no VMA ⇒ invalid */
+    /* 2) Decode fault type */
+    int write_fault   = (error_code == ERR_CODE_WRITE || error_code == ERR_CODE_PROT);
+    int protection_fault = (error_code == ERR_CODE_PROT);
 
-    /* 2) Protection / COW fault? */
-    if (is_present && is_write) {
+    /* 2a) COW break? */
+    if (protection_fault && write_fault) {
         if (!(vma->access_flags & PROT_WRITE))
-            return -1;  /* write to read-only */
+            return -1;            /* really read-only ⇒ segfault */
         return handle_cow_fault(current, fault_va, vma->access_flags);
     }
+    /* 2b) Not-present fault ⇒ lazy allocate */
+    if (error_code == ERR_CODE_READ || error_code == ERR_CODE_WRITE) {
+        if (write_fault && !(vma->access_flags & PROT_WRITE))
+            return -1;            /* write into R-only VMA ⇒ invalid */
 
-    /* 3) Lazy allocate on not-present fault */
-    if (!is_present) {
-        if (is_write && !(vma->access_flags & PROT_WRITE))
-            return -1;
-
-        /* allocate and zero a new user page */
+        /* alloc a new user page */
         u32 new_pfn = os_pfn_alloc(USER_REG);
         if (!new_pfn) return -ENOMEM;
-        memset(osmap(new_pfn), 0, PAGE_SIZE);
 
-        /* walk/create 4-level page table */
-        u64 *table = (u64*)osmap(current->pgd);
-        for (int lvl = 0; lvl < 4; lvl++) {
-            int shift = (lvl==0?PGD_SHIFT:
-                         lvl==1?PUD_SHIFT:
-                         lvl==2?PMD_SHIFT:PTE_SHIFT);
-            u64 idx = va_to_index(fault_va, shift);
+        /* zero it manually */
+        {
+            char *page = (char*)osmap(new_pfn);
+            for (u64 i = 0; i < PAGE_SIZE; i++)
+                page[i] = 0;
+        }
+
+        /* walk/create 4-level table */
+        u64 *pgd = (u64*)osmap(current->pgd);
+        u64 *table = pgd;
+        for (int level = 0; level < 4; level++) {
+            int shift = (level==0?PGD_SHIFT:level==1?PUD_SHIFT:
+                         level==2?PMD_SHIFT:PTE_SHIFT);
+            u64 idx = (fault_va >> shift) & (PTRS_PER_PT - 1);
             u64 ent = table[idx];
 
-            if (lvl < 3) {
-                /* ensure next level exists */
-                if (!(ent & PTE_P)) {
+            if (level < 3) {
+                /* ensure next-level exists */
+                if (!(ent & PTE_PRESENT)) {
                     u32 pfn = os_pfn_alloc(OS_PT_REG);
-                    if (!pfn) { os_pfn_free(USER_REG,new_pfn); return -ENOMEM; }
-                    memset(osmap(pfn),0,PAGE_SIZE);
-                    table[idx] = (pfn<<PAGE_SHIFT) | PTE_P|PTE_W|PTE_U;
+                    if (!pfn) return -ENOMEM;
+                    /* clear new PT page */
+                    {
+                        char *pt = (char*)osmap(pfn);
+                        for (u64 i=0;i<PAGE_SIZE;i++) pt[i]=0;
+                    }
+                    table[idx] = (pfn << PAGE_SHIFT)
+                                | PTE_PRESENT|PTE_RW|PTE_USER;
                 }
-                table = (u64*)osmap(table[idx] >> PAGE_SHIFT);
+                /* descend */
+                table = (u64*)osmap((table[idx] >> PAGE_SHIFT));
             } else {
-                /* leaf PTE */
-                u64 flags = PTE_P|PTE_U
-                          | ((vma->access_flags&PROT_WRITE)?PTE_W:0);
-                table[idx] = (new_pfn<<PAGE_SHIFT) | flags;
+                /* leaf: map our new frame */
+                u64 flags = PTE_PRESENT|PTE_USER
+                          | ((vma->access_flags & PROT_WRITE)?PTE_RW:0);
+                table[idx] = (new_pfn << PAGE_SHIFT) | flags;
             }
         }
-        return 1;
+        return 1;  /* success */
     }
 
+    /* all other cases invalid */
     return -1;
 }
 
 /**
- * Part2.2 – munmap with page freeing.
+ * Part 2.2: munmap must also free any already-mapped PFNs in [addr,addr+len).
  */
 long vm_area_unmap(struct exec_context *current, u64 addr, int length)
 {
@@ -75,42 +121,51 @@ long vm_area_unmap(struct exec_context *current, u64 addr, int length)
     u64 len   = align_length(length);
     u64 start = addr, end = addr + len;
 
-    /* 0) free any mapped user-pages in [start,end) */
+    /* free any already mapped pages */
     u64 *pgd_tbl = (u64*)osmap(current->pgd);
     for (u64 va = start; va < end; va += PAGE_SIZE) {
-        u64 ent = pgd_tbl[PGD_INDEX(va)];
-        if (!(ent & PTE_P)) continue;
-        u64 *pud = (u64*)osmap(ent >> PAGE_SHIFT);
+        u64 ent;
+        u64 *pud, *pmd, *pte;
 
+        /* PGD */
+        ent = pgd_tbl[PGD_INDEX(va)];
+        if (!(ent & PTE_PRESENT)) continue;
+        pud = (u64*)osmap(ent >> PAGE_SHIFT);
+
+        /* PUD */
         ent = pud[PUD_INDEX(va)];
-        if (!(ent & PTE_P)) continue;
-        u64 *pmd = (u64*)osmap(ent >> PAGE_SHIFT);
+        if (!(ent & PTE_PRESENT)) continue;
+        pmd = (u64*)osmap(ent >> PAGE_SHIFT);
 
+        /* PMD */
         ent = pmd[PMD_INDEX(va)];
-        if (!(ent & PTE_P)) continue;
-        u64 *pte = (u64*)osmap(ent >> PAGE_SHIFT);
+        if (!(ent & PTE_PRESENT)) continue;
+        pte = (u64*)osmap(ent >> PAGE_SHIFT);
 
+        /* PTE */
         ent = pte[PTE_INDEX(va)];
-        if (!(ent & PTE_P)) continue;
+        if (!(ent & PTE_PRESENT)) continue;
 
+        /* free frame and clear entry */
         os_pfn_free(USER_REG, (u32)(ent >> PAGE_SHIFT));
         pte[PTE_INDEX(va)] = 0;
     }
 
-    /* 1) now trim/split/remove VMAs exactly as Part1 unmap */
-    struct vm_area *head = current->vm_area, *prev = head, *iter = head->vm_next;
+    /* now trim/split/remove VMAs exactly as before */
+    struct vm_area *dummy = current->vm_area, *prev = dummy, *iter = dummy->vm_next;
     while (iter) {
-        if (!range_overlap(start,end, iter->vm_start, iter->vm_end)) {
+        if (!range_overlap(start, end, iter->vm_start, iter->vm_end)) {
             prev = iter; iter = iter->vm_next;
             continue;
         }
-        u64 ov_s = start > iter->vm_start ? start : iter->vm_start;
-        u64 ov_e = end   < iter->vm_end   ? end   : iter->vm_end;
+        u64 ov_s = (start > iter->vm_start?start:iter->vm_start);
+        u64 ov_e = (end   < iter->vm_end  ?end  :iter->vm_end);
 
         if (ov_s <= iter->vm_start && ov_e >= iter->vm_end) {
             /* fully covered */
             prev->vm_next = iter->vm_next;
             os_free(iter, sizeof(*iter));
+            stats->num_vm_area--;
             iter = prev->vm_next;
         }
         else if (ov_s <= iter->vm_start) {
@@ -124,7 +179,7 @@ long vm_area_unmap(struct exec_context *current, u64 addr, int length)
             prev = iter; iter = iter->vm_next;
         }
         else {
-            /* interior split */
+            /* split interior */
             struct vm_area *new_vma = os_alloc(sizeof(*new_vma));
             if (!new_vma) return -ENOMEM;
             new_vma->vm_start     = ov_e;
@@ -133,15 +188,15 @@ long vm_area_unmap(struct exec_context *current, u64 addr, int length)
             new_vma->vm_next      = iter->vm_next;
             iter->vm_end          = ov_s;
             iter->vm_next         = new_vma;
+            stats->num_vm_area++;
             prev = new_vma; iter = new_vma->vm_next;
         }
     }
-
     return 0;
 }
 
 /**
- * Part2.3 – mprotect with PTE updates.
+ * Part 2.3: mprotect must also patch any already-mapped PTEs to new RW bits.
  */
 long vm_area_mprotect(struct exec_context *current, u64 addr, int length, int prot)
 {
@@ -151,45 +206,51 @@ long vm_area_mprotect(struct exec_context *current, u64 addr, int length, int pr
     u64 len   = align_length(length);
     u64 start = addr, end = addr + len;
 
-    /* 0) update any already-mapped pages’ RW bit */
+    /* update any existing PTEs in that range */
     u64 *pgd_tbl = (u64*)osmap(current->pgd);
     for (u64 va = start; va < end; va += PAGE_SIZE) {
-        u64 ent = pgd_tbl[PGD_INDEX(va)];
-        if (!(ent & PTE_P)) continue;
-        u64 *pud = (u64*)osmap(ent >> PAGE_SHIFT);
+        u64 ent;
+        u64 *pud, *pmd, *pte;
+
+        ent = pgd_tbl[PGD_INDEX(va)];
+        if (!(ent & PTE_PRESENT)) continue;
+        pud = (u64*)osmap(ent >> PAGE_SHIFT);
 
         ent = pud[PUD_INDEX(va)];
-        if (!(ent & PTE_P)) continue;
-        u64 *pmd = (u64*)osmap(ent >> PAGE_SHIFT);
+        if (!(ent & PTE_PRESENT)) continue;
+        pmd = (u64*)osmap(ent >> PAGE_SHIFT);
 
         ent = pmd[PMD_INDEX(va)];
-        if (!(ent & PTE_P)) continue;
-        u64 *pte = (u64*)osmap(ent >> PAGE_SHIFT);
+        if (!(ent & PTE_PRESENT)) continue;
+        pte = (u64*)osmap(ent >> PAGE_SHIFT);
 
         ent = pte[PTE_INDEX(va)];
-        if (!(ent & PTE_P)) continue;
+        if (!(ent & PTE_PRESENT)) continue;
 
+        /* rebuild leaf with new RW bit */
         u32 pfn = (u32)(ent >> PAGE_SHIFT);
-        u64 flags = PTE_P | PTE_U
-                  | ((prot==(PROT_READ|PROT_WRITE)) ? PTE_W : 0);
-        pte[PTE_INDEX(va)] = (pfn<<PAGE_SHIFT) | flags;
+        u64 flags = PTE_PRESENT|PTE_USER
+                  | ((prot == (PROT_READ|PROT_WRITE))?PTE_RW:0);
+        pte[PTE_INDEX(va)] = (pfn << PAGE_SHIFT) | flags;
     }
 
-    /* 1) adjust VMAs exactly as Part1 mprotect */
-    struct vm_area *head = current->vm_area, *prev = head, *iter = head->vm_next;
+    /* then adjust VMAs exactly as your Part 1 mprotect did */
+    struct vm_area *dummy = current->vm_area, *prev = dummy, *iter = dummy->vm_next;
     while (iter) {
-        if (!range_overlap(start,end, iter->vm_start, iter->vm_end)) {
+        if (!range_overlap(start, end, iter->vm_start, iter->vm_end)) {
             prev = iter; iter = iter->vm_next;
             continue;
         }
-        u64 ov_s = start > iter->vm_start ? start : iter->vm_start;
-        u64 ov_e = end   < iter->vm_end   ? end   : iter->vm_end;
+        u64 ov_s = (start > iter->vm_start?start:iter->vm_start);
+        u64 ov_e = (end   < iter->vm_end  ?end  :iter->vm_end);
 
         if (ov_s <= iter->vm_start && ov_e >= iter->vm_end) {
+            /* fully covered: change flags */
             iter->access_flags = prot;
             prev = iter; iter = iter->vm_next;
         }
         else if (ov_s <= iter->vm_start) {
+            /* split front */
             struct vm_area *post = os_alloc(sizeof(*post));
             if (!post) return -ENOMEM;
             post->vm_start     = ov_e;
@@ -199,9 +260,11 @@ long vm_area_mprotect(struct exec_context *current, u64 addr, int length, int pr
             iter->vm_end       = ov_e;
             iter->access_flags = prot;
             iter->vm_next      = post;
+            stats->num_vm_area++;
             prev = post; iter = post->vm_next;
         }
         else if (ov_e >= iter->vm_end) {
+            /* split back */
             struct vm_area *pre = os_alloc(sizeof(*pre));
             if (!pre) return -ENOMEM;
             pre->vm_start      = iter->vm_start;
@@ -211,9 +274,11 @@ long vm_area_mprotect(struct exec_context *current, u64 addr, int length, int pr
             iter->vm_start     = ov_s;
             iter->access_flags = prot;
             iter->vm_next      = pre;
+            stats->num_vm_area++;
             prev = pre; iter = pre->vm_next;
         }
         else {
+            /* interior split */
             struct vm_area *mid  = os_alloc(sizeof(*mid));
             struct vm_area *post = os_alloc(sizeof(*post));
             if (!mid || !post) return -ENOMEM;
@@ -227,9 +292,9 @@ long vm_area_mprotect(struct exec_context *current, u64 addr, int length, int pr
             mid->vm_next        = post;
             iter->vm_end        = ov_s;
             iter->vm_next       = mid;
+            stats->num_vm_area += 2;
             prev = post; iter = post->vm_next;
         }
     }
-
     return 0;
 }
