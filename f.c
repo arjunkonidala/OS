@@ -9,30 +9,25 @@
  * You must not declare and use any static/global variables 
  * */
 
-#define PAGE_SIZE    4096                  
+                
 #define PGD_SHIFT    39
 #define PUD_SHIFT    30
 #define PMD_SHIFT    21
 #define PTE_SHIFT    12
 #define PTRS_PER_PT  512ULL
 
-#define PAGE_SHIFT    12    /* number of bits to shift to get page offset */
-// #define USER_REG      0            /* region index for user pages */
-// #define OS_PT_REG     1            /* region index for OS page‐table pages */
 
-#define FOUR_KB 0x1000
+
+
 
 #define PGD_MASK 0xFF8000000000
 #define PUD_MASK 0x7FC0000000
 #define PMD_MASK 0x3FE00000
 #define PTE_MASK 0x1FF000
 
-/* Page‑fault error codes from assignment */
 #define ERR_CODE_READ    0x4
 #define ERR_CODE_WRITE   0x6
 #define ERR_CODE_PROT    0x7
-
-/* PTE flag bits (as in gemOS/page.h) */
 #define PTE_P   (1ULL << 0)
 #define PTE_W   (1ULL << 1)
 #define PTE_U   (1ULL << 2)
@@ -46,75 +41,61 @@ static int range_overlap(u64 s1, u64 e1, u64 s2, u64 e2)
 }
 static u64 pgsizecalc(u64 len) 
 {
-    return ((len + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE;
+    return ((len + 0x1000 - 1) / 0x1000) * 0x1000;
 }
  
 
-void updatePTPermissions(u64 pfn, u64 pgd_entry_VA, u64 pud_entry_VA, u64 pmd_entry_VA) {
-    
-    
-
-    u64 addr_ptr = (u64)osmap( ( *((u64*)pmd_entry_VA) ) >> 12) ;
-    while(addr_ptr < (u64)osmap( ( *((u64*)pmd_entry_VA) ) >> 12) + PT_SIZE) {
+void uPTPp(u64 pfn, u64 pgd_e, u64 pud_e, u64 pmd_e) {
+    u64 a_ptr = (u64)osmap( ( *((u64*)pmd_e) ) >> 12) ;
+    while(a_ptr < (u64)osmap( ( *((u64*)pmd_e) ) >> 12) + PT_SIZE) {
        
-        if( ( ( ( *((u64*)addr_ptr) ) >> 0x3) & 0x1 ) ==  0x1 ) return;
-        addr_ptr += PTE_SIZE;
+        if( ( ( ( *((u64*)a_ptr) ) >> 0x3) & 0x1 ) ==  0x1 ) return;
+        a_ptr += PTE_SIZE;
     }
-
-    
-    *((u64*)pmd_entry_VA) &= ~(0x3);
-
-    
-    addr_ptr = (u64)osmap( ( *((u64*)pud_entry_VA) ) >> 12) ;
-    while(addr_ptr < (u64)osmap( ( *((u64*)pud_entry_VA) ) >> 12) + PT_SIZE) {
+    *((u64*)pmd_e) &= ~(0x3);
+    a_ptr = (u64)osmap( ( *((u64*)pud_e) ) >> 12) ;
+    while(a_ptr < (u64)osmap( ( *((u64*)pud_e) ) >> 12) + PT_SIZE) {
         
-        if( ( ( ( *((u64*)addr_ptr) ) >> 0x3) & 0x1 ) ==  0x1 ) return;
-        addr_ptr += PTE_SIZE;
+        if( ( ( ( *((u64*)a_ptr) ) >> 0x3) & 0x1 ) ==  0x1 ) return;
+        a_ptr += PTE_SIZE;
     }
-
-    *((u64*)pud_entry_VA) &= ~(0x3);
-
-    addr_ptr = (u64)osmap( ( *((u64*)pgd_entry_VA) ) >> 12) ;
-    while(addr_ptr < (u64)osmap( ( *((u64*)pgd_entry_VA) ) >> 12) + PT_SIZE) {
-        if( ( ( ( *((u64*)addr_ptr) ) >> 0x3) & 0x1 ) ==  0x1 ) return;
-        addr_ptr += PTE_SIZE;
-        asm volatile("invlpg (%0);" ::"r"(addr_ptr) : "memory");
+    *((u64*)pud_e) &= ~(0x3);
+    a_ptr = (u64)osmap( ( *((u64*)pgd_e) ) >> 12) ;
+    while(a_ptr < (u64)osmap( ( *((u64*)pgd_e) ) >> 12) + PT_SIZE) {
+        if( ( ( ( *((u64*)a_ptr) ) >> 0x3) & 0x1 ) ==  0x1 ) return;
+        a_ptr += PTE_SIZE;
+        asm volatile("invlpg (%0);" ::"r"(a_ptr) : "memory");
     }
-
-    *((u64*)pgd_entry_VA) &= ~(0x3);
-    
+    *((u64*)pgd_e) &= ~(0x3);
     return;
 }
 
-void freePFN(long addr) {
-
+void f_pfn(long addr) {
     struct exec_context *current = get_current_ctx();
-
-
     u64 pgdIdx = (addr & PGD_MASK) >> PGD_SHIFT;
     u64 pudIdx = (addr & PUD_MASK) >> PUD_SHIFT;
     u64 pmdIdx = (addr & PMD_MASK) >> PMD_SHIFT;
     u64 pteIdx = (addr & PTE_MASK) >> PTE_SHIFT;
 
-    u64 pgd_entry_VA = ((u64)osmap(current->pgd)) + (pgdIdx)*(PTE_SIZE);
+    u64 pgd_e = ((u64)osmap(current->pgd)) + (pgdIdx)*(PTE_SIZE);
 
-    if( ( *((u64*)pgd_entry_VA) & 1 ) == 0) {
+    if( ( *((u64*)pgd_e) & 1 ) == 0) {
         return;
     }
 
-    u64 pud_entry_VA = ((u64)osmap( ( ( *((u64*)pgd_entry_VA)  ) >> ADDR_SHIFT) ) ) + (pudIdx)*(PTE_SIZE);
+    u64 pud_e = ((u64)osmap( ( ( *((u64*)pgd_e)  ) >> ADDR_SHIFT) ) ) + (pudIdx)*(PTE_SIZE);
 
-    if( ( *((u64*)pud_entry_VA) & 1 ) == 0) {
+    if( ( *((u64*)pud_e) & 1 ) == 0) {
         return;
     }
 
-    u64 pmd_entry_VA = ((u64)osmap( ( ( *((u64*)pud_entry_VA)  ) >> ADDR_SHIFT) ) ) + (pmdIdx)*(PTE_SIZE);
+    u64 pmd_e = ((u64)osmap( ( ( *((u64*)pud_e)  ) >> ADDR_SHIFT) ) ) + (pmdIdx)*(PTE_SIZE);
 
-    if( ( *((u64*)pmd_entry_VA) & 1 ) == 0) {
+    if( ( *((u64*)pmd_e) & 1 ) == 0) {
         return;
     }
 
-    u64 pte_entry_VA = ((u64)osmap( ( ( *((u64*)pmd_entry_VA)  ) >> ADDR_SHIFT) ) ) + (pteIdx)*(PTE_SIZE);
+    u64 pte_entry_VA = ((u64)osmap( ( ( *((u64*)pmd_e)  ) >> ADDR_SHIFT) ) ) + (pteIdx)*(PTE_SIZE);
 
     if( ( *((u64*)pte_entry_VA) & 1 ) == 0) {
         return;
@@ -136,10 +117,10 @@ void freePFN(long addr) {
 
 void freeAllPFNs(long addr_start, long addr_end) {
 
-    int numPages = (addr_end - addr_start) / (FOUR_KB);
+    int numPages = (addr_end - addr_start) / (0x1000);
 
     for(int i = 0; i < numPages; i++) {
-        freePFN(addr_start + i*(FOUR_KB));
+     f_pfn(addr_start + i*(0x1000));
     }
 }
 void updatePFN(long addr, int prot) {
@@ -151,25 +132,25 @@ void updatePFN(long addr, int prot) {
     u64 pmdIdx = (addr & PMD_MASK) >> PMD_SHIFT;
     u64 pteIdx = (addr & PTE_MASK) >> PTE_SHIFT;
 
-    u64 pgd_entry_VA = ((u64)osmap(current->pgd)) + (pgdIdx)*(PTE_SIZE);
+    u64 pgd_e = ((u64)osmap(current->pgd)) + (pgdIdx)*(PTE_SIZE);
 
-    if( ( *((u64*)pgd_entry_VA) & 1 ) == 0) {
+    if( ( *((u64*)pgd_e) & 1 ) == 0) {
         return;
     }
 
-    u64 pud_entry_VA = ((u64)osmap( ( ( *((u64*)pgd_entry_VA)  ) >> ADDR_SHIFT) ) ) + (pudIdx)*(PTE_SIZE);
+    u64 pud_e = ((u64)osmap( ( ( *((u64*)pgd_e)  ) >> ADDR_SHIFT) ) ) + (pudIdx)*(PTE_SIZE);
 
-    if( ( *((u64*)pud_entry_VA) & 1 ) == 0) {
+    if( ( *((u64*)pud_e) & 1 ) == 0) {
         return;
     }
 
-    u64 pmd_entry_VA = ((u64)osmap( ( ( *((u64*)pud_entry_VA)  ) >> ADDR_SHIFT) ) ) + (pmdIdx)*(PTE_SIZE);
+    u64 pmd_e = ((u64)osmap( ( ( *((u64*)pud_e)  ) >> ADDR_SHIFT) ) ) + (pmdIdx)*(PTE_SIZE);
 
-    if( ( *((u64*)pmd_entry_VA) & 1 ) == 0) {
+    if( ( *((u64*)pmd_e) & 1 ) == 0) {
         return;
     }
 
-    u64 pte_entry_VA = ((u64)osmap( ( ( *((u64*)pmd_entry_VA)  ) >> ADDR_SHIFT) ) ) + (pteIdx)*(PTE_SIZE);
+    u64 pte_entry_VA = ((u64)osmap( ( ( *((u64*)pmd_e)  ) >> ADDR_SHIFT) ) ) + (pteIdx)*(PTE_SIZE);
 
     if( ( *((u64*)pte_entry_VA) & 1 ) == 0) {
         return;
@@ -179,7 +160,7 @@ void updatePFN(long addr, int prot) {
         *((u64*)pte_entry_VA) &= ~(0x8);
 
         u64 pfn = ( ( *((u64*)pte_entry_VA)  ) >> ADDR_SHIFT );
-        updatePTPermissions(pfn,pgd_entry_VA,pud_entry_VA,pmd_entry_VA);
+        uPTPp(pfn,pgd_e,pud_e,pmd_e);
     }
     else {
 
@@ -196,9 +177,9 @@ void updatePFN(long addr, int prot) {
         }
 
         *((u64*)pte_entry_VA) |= 0x8;
-        *((u64*)pmd_entry_VA) |= 0x8;
-        *((u64*)pud_entry_VA) |= 0x8;
-        *((u64*)pgd_entry_VA) |= 0x8;
+        *((u64*)pmd_e) |= 0x8;
+        *((u64*)pud_e) |= 0x8;
+        *((u64*)pgd_e) |= 0x8;
 
     }
     
@@ -206,10 +187,10 @@ void updatePFN(long addr, int prot) {
 }
 void updateAllPFNs(long addr_start, long addr_end, int prot) {
 
-    int numPages = (addr_end - addr_start) / (FOUR_KB);
+    int numPages = (addr_end - addr_start) / (0x1000);
 
     for(int i = 0; i < numPages; i++) {
-        updatePFN(addr_start + i*(FOUR_KB), prot);
+        updatePFN(addr_start + i*(0x1000), prot);
     }
 }
 long vm_area_mprotect(struct exec_context *current, u64 addr, int length, int prot) 
@@ -377,7 +358,7 @@ long vm_area_map(struct exec_context *current, u64 addr, int length, int prot, i
         struct vm_area *x = os_alloc(sizeof(*x));
         if (!x) return -ENOMEM;
         x->vm_start     = MMAP_AREA_START;
-        x->vm_end       = MMAP_AREA_START + FOUR_KB;
+        x->vm_end       = MMAP_AREA_START + 0x1000;
         x->access_flags = 0;
         x->vm_next      = NULL;
         current->vm_area = x;
@@ -689,10 +670,10 @@ long vm_area_pagefault(struct exec_context *current, u64 addr, int error_code)
     u64 pteIdx = (addr & PTE_MASK) >> PTE_SHIFT;
 
     // calculate the entry of in the first level of the page table
-    u64 pgd_entry_VA = ((u64)osmap(current->pgd)) + (pgdIdx)*(PTE_SIZE);
+    u64 pgd_e = ((u64)osmap(current->pgd)) + (pgdIdx)*(PTE_SIZE);
 
     // check if page frame has been allocated for the next level of the page table
-    if( ( *((u64*)pgd_entry_VA) & 1 ) == 0) {
+    if( ( *((u64*)pgd_e) & 1 ) == 0) {
         // allocate pfn for pud_t
         u64 pud_pfn = os_pfn_alloc(OS_PT_REG);
         if(pud_pfn == 0) {
@@ -700,19 +681,19 @@ long vm_area_pagefault(struct exec_context *current, u64 addr, int error_code)
         }
 
         // update the pgd_entry
-        *((u64*)pgd_entry_VA) = (pud_pfn << ADDR_SHIFT) | 0x1;  // set the present bit along with the pfn value
-        *((u64*)pgd_entry_VA) |= 0x10;                          // set the user bit
+        *((u64*)pgd_e) = (pud_pfn << ADDR_SHIFT) | 0x1;  // set the present bit along with the pfn value
+        *((u64*)pgd_e) |= 0x10;                          // set the user bit
 
         if(vma->access_flags == 0x3) {
-            *((u64*)pgd_entry_VA) |= 0x8;                       // set the read/write bit
+            *((u64*)pgd_e) |= 0x8;                       // set the read/write bit
         }
     }
 
     // calculate the entry of in the second level of the page table
-    u64 pud_entry_VA = ((u64)osmap( ( ( *((u64*)pgd_entry_VA)  ) >> ADDR_SHIFT) ) ) + (pudIdx)*(PTE_SIZE);
+    u64 pud_e = ((u64)osmap( ( ( *((u64*)pgd_e)  ) >> ADDR_SHIFT) ) ) + (pudIdx)*(PTE_SIZE);
 
     // check if page frame has been allocated for the next level of the page table
-    if( ( *((u64*)pud_entry_VA) & 1 ) == 0) {
+    if( ( *((u64*)pud_e) & 1 ) == 0) {
         // allocate pfn for pmd_t
         u64 pmd_pfn = os_pfn_alloc(OS_PT_REG);
         if(pmd_pfn == 0) {
@@ -720,19 +701,19 @@ long vm_area_pagefault(struct exec_context *current, u64 addr, int error_code)
         }
 
         // update the pud_entry
-        *((u64*)pud_entry_VA) = (pmd_pfn << ADDR_SHIFT) | 0x1;  // set the present bit along with the pfn value
-        *((u64*)pud_entry_VA) |= 0x10;                          // set the user bit
+        *((u64*)pud_e) = (pmd_pfn << ADDR_SHIFT) | 0x1;  // set the present bit along with the pfn value
+        *((u64*)pud_e) |= 0x10;                          // set the user bit
 
         if(vma->access_flags == 0x3) {
-            *((u64*)pud_entry_VA) |= 0x8;                       // set the read/write bit
+            *((u64*)pud_e) |= 0x8;                       // set the read/write bit
         }
     }
 
     // calculate the entry of in the third level of the page table
-    u64 pmd_entry_VA = ((u64)osmap( ( ( *((u64*)pud_entry_VA)  ) >> ADDR_SHIFT) ) ) + (pmdIdx)*(PTE_SIZE);
+    u64 pmd_e = ((u64)osmap( ( ( *((u64*)pud_e)  ) >> ADDR_SHIFT) ) ) + (pmdIdx)*(PTE_SIZE);
 
     // check if page frame has been allocated for the next level of the page table
-    if( ( *((u64*)pmd_entry_VA) & 1 ) == 0) {
+    if( ( *((u64*)pmd_e) & 1 ) == 0) {
         // allocate pfn for pte_t
         u64 pte_pfn = os_pfn_alloc(OS_PT_REG);
         if(pte_pfn == 0) {
@@ -740,16 +721,16 @@ long vm_area_pagefault(struct exec_context *current, u64 addr, int error_code)
         }
 
         // update the pmd_entry
-        *((u64*)pmd_entry_VA) = (pte_pfn << ADDR_SHIFT) | 0x1;  // set the present bit along with the pfn value
-        *((u64*)pmd_entry_VA) |= 0x10;                          // set the user bit
+        *((u64*)pmd_e) = (pte_pfn << ADDR_SHIFT) | 0x1;  // set the present bit along with the pfn value
+        *((u64*)pmd_e) |= 0x10;                          // set the user bit
 
         if(vma->access_flags == 0x3) {
-            *((u64*)pmd_entry_VA) |= 0x8;                       // set the read/write bit
+            *((u64*)pmd_e) |= 0x8;                       // set the read/write bit
         }
     }
 
     // calculate the entry of in the final level of the page table
-    u64 pte_entry_VA = ((u64)osmap( ( ( *((u64*)pmd_entry_VA)  ) >> ADDR_SHIFT) ) ) + (pteIdx)*(PTE_SIZE);
+    u64 pte_entry_VA = ((u64)osmap( ( ( *((u64*)pmd_e)  ) >> ADDR_SHIFT) ) ) + (pteIdx)*(PTE_SIZE);
 
     // check if page frame has been allocated for the final level of the page table
     if( ( *((u64*)pte_entry_VA) & 1 ) == 0) {
