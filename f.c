@@ -17,8 +17,8 @@
 #define PTRS_PER_PT  512ULL
 
 #define PAGE_SHIFT    12    /* number of bits to shift to get page offset */
-#define USER_REG      0            /* region index for user pages */
-#define OS_PT_REG     1            /* region index for OS page‐table pages */
+// #define USER_REG      0            /* region index for user pages */
+// #define OS_PT_REG     1            /* region index for OS page‐table pages */
 
 #define FOUR_KB 0x1000
 
@@ -78,10 +78,11 @@ void updatePTPermissions(u64 pfn, u64 pgd_entry_VA, u64 pud_entry_VA, u64 pmd_en
     while(addr_ptr < (u64)osmap( ( *((u64*)pgd_entry_VA) ) >> 12) + PT_SIZE) {
         if( ( ( ( *((u64*)addr_ptr) ) >> 0x3) & 0x1 ) ==  0x1 ) return;
         addr_ptr += PTE_SIZE;
+        asm volatile("invlpg (%0);" ::"r"(addr_ptr) : "memory");
     }
 
     *((u64*)pgd_entry_VA) &= ~(0x3);
-
+    
     return;
 }
 
@@ -130,6 +131,7 @@ void freePFN(long addr) {
         os_pfn_free(USER_REG,pfn);
     }
    
+    asm volatile("invlpg (%0);" ::"r"(addr) : "memory");
 }
 
 void freeAllPFNs(long addr_start, long addr_end) {
@@ -200,6 +202,7 @@ void updatePFN(long addr, int prot) {
 
     }
     
+    asm volatile("invlpg (%0);" ::"r"(addr) : "memory");
 }
 void updateAllPFNs(long addr_start, long addr_end, int prot) {
 
@@ -209,13 +212,10 @@ void updateAllPFNs(long addr_start, long addr_end, int prot) {
         updatePFN(addr_start + i*(FOUR_KB), prot);
     }
 }
-
-
 long vm_area_mprotect(struct exec_context *current, u64 addr, int length, int prot) 
 {
     if (length <= 0) return -EINVAL;
-
-    if (prot != PROT_READ && prot != (PROT_READ|PROT_WRITE)) return -EINVAL;
+    if (prot != PROT_READ && prot != (PROT_READ|PROT_WRITE)) return -EINVAL ;
 
     u64 len = pgsizecalc(length);
     u64 start = addr;
@@ -331,7 +331,6 @@ long vm_area_mprotect(struct exec_context *current, u64 addr, int length, int pr
         d1=d1->vm_next;
     }
     exit:
-
     //merge
     struct vm_area* i1,*i2;
     i1=current->vm_area;
@@ -373,146 +372,136 @@ long vm_area_mprotect(struct exec_context *current, u64 addr, int length, int pr
 long vm_area_map(struct exec_context *current, u64 addr, int length, int prot, int flags)
 {
     struct vm_area *head = current->vm_area;
-    if(head==0){
-        
-        
-        struct vm_area* x=os_alloc(sizeof(struct vm_area));
-        x->vm_start=MMAP_AREA_START;
-        x->vm_end=MMAP_AREA_START+4096;
-        x->vm_next=head;
-        x->access_flags=0x0;
-        head=x;
+    /* ——— initialize the dummy head if this is the first mmap ——— */
+    if (!head) {
+        struct vm_area *x = os_alloc(sizeof(*x));
+        if (!x) return -ENOMEM;
+        x->vm_start     = MMAP_AREA_START;
+        x->vm_end       = MMAP_AREA_START + FOUR_KB;
+        x->access_flags = 0;
+        x->vm_next      = NULL;
         current->vm_area = x;
         stats->num_vm_area = 1;
-        
+        head = x;
     }
 
-    struct vm_area *d, *d1;
+    /* ——— validate arguments ——— */
+    if (length <= 0 || length > (2 << 20))
+        return -EINVAL;
+    if (prot != PROT_READ && prot != (PROT_READ|PROT_WRITE))
+        return -EINVAL;
+    if ((flags & MAP_FIXED) && addr == 0)
+        return -EINVAL;
+
     u64 length_aligned = pgsizecalc(length);
-    u64 start = 0;
-    int use_fixed = (flags & MAP_FIXED) != 0;
+    int use_fixed      = (flags & MAP_FIXED) != 0;
+    u64 start          = 0;
+    int found          = 0;
 
-    /* Validate args */
-    if (length <= 0 || length > (2 << 20)) return -EINVAL;
-    if (prot != PROT_READ && prot != (PROT_READ|PROT_WRITE)) return -EINVAL;
-    if (use_fixed && addr == 0) return -EINVAL;
-
-    /* MAP_FIXED: exact region must be free */
-    if (use_fixed) 
-    {
+    /* ——— MAP_FIXED: must fit exactly and not overlap ——— */
+    if (use_fixed) {
         u64 end = addr + length_aligned;
-        if (addr < MMAP_AREA_START || end > MMAP_AREA_END) return -EINVAL;
-        for (d1 = head->vm_next; d1; d1 = d1->vm_next) 
-        {
-            if (range_overlap(addr, end, d1->vm_start, d1->vm_end)) return -EINVAL;
+        if (addr < MMAP_AREA_START || end > MMAP_AREA_END)
+            return -EINVAL;
+        for (struct vm_area *q = head->vm_next; q; q = q->vm_next) {
+            if (range_overlap(addr, end, q->vm_start, q->vm_end))
+                return -EINVAL;
         }
         start = addr;
-        goto create;
+        found = 1;
     }
 
-    /* Hint: try addr if within limits and free */
-    if (addr) 
-    {
+    /* ——— non‐fixed hint: try the user’s hint if it fits ——— */
+    if (!found && addr) {
         u64 hint_start = addr;
-        u64 hint_end = addr + length_aligned;
-        if (hint_start >= MMAP_AREA_START && hint_end <= MMAP_AREA_END)
-        {
+        u64 hint_end   = addr + length_aligned;
+        if (hint_start >= MMAP_AREA_START && hint_end <= MMAP_AREA_END) {
             int ok = 1;
-            for (d1 = head->vm_next; d1; d1 = d1->vm_next) 
-            {
-                if (range_overlap(hint_start, hint_end, d1->vm_start, d1->vm_end)) { ok = 0; break; }
+            for (struct vm_area *q = head->vm_next; q; q = q->vm_next) {
+                if (range_overlap(hint_start, hint_end, q->vm_start, q->vm_end)) {
+                    ok = 0;
+                    break;
+                }
             }
-            if (ok) { start = hint_start; goto create; }
+            if (ok) {
+                start = hint_start;
+                found = 1;
+            }
         }
     }
 
-    /* Find first hole */
-    d = head;
-    for (d1 = head->vm_next; d1; d = d1, d1 = d1->vm_next) 
-    {
-        u64 hole_start;
-        if (d->vm_end < MMAP_AREA_START )
-        {
-            hole_start = MMAP_AREA_START;
+    /* ——— find the first hole big enough in between existing VMAs ——— */
+    if (!found) {
+        struct vm_area *prev = head;
+        for (struct vm_area *q = head->vm_next; q; prev = q, q = q->vm_next) {
+            u64 hole_start = (prev->vm_end < MMAP_AREA_START
+                              ? MMAP_AREA_START
+                              : prev->vm_end);
+            u64 hole_end   = (q->vm_start > MMAP_AREA_END
+                              ? MMAP_AREA_END
+                              : q->vm_start);
+            if (hole_end - hole_start >= length_aligned) {
+                start = hole_start;
+                found = 1;
+                break;
+            }
         }
-        else hole_start = d->vm_end;
-
-
-        // u64 hole_end = d1->vm_start > MMAP_AREA_END ? MMAP_AREA_END : d1->vm_start;
-
-        u64 hole_end;
-        if (d1->vm_start > MMAP_AREA_END)
-        {
-            hole_end = MMAP_AREA_END;
+        /* ——— after the last VMA ——— */
+        if (!found) {
+            struct vm_area *last = head;
+            while (last->vm_next) last = last->vm_next;
+            u64 hole_start = (last->vm_end < MMAP_AREA_START
+                              ? MMAP_AREA_START
+                              : last->vm_end);
+            if (MMAP_AREA_END - hole_start >= length_aligned) {
+                start = hole_start;
+                found = 1;
+            }
         }
-        else hole_end = d1->vm_start;
-
-
-        if (hole_end - hole_start >= length_aligned) { start = hole_start; goto create; }
     }
 
-    /* After last VMA */
-    {   
-        u64 hole_start;
-        if (d->vm_end < MMAP_AREA_START)
-        {
-            hole_start = MMAP_AREA_START;
-        }
-        else hole_start = d->vm_end;
+    if (!found)
+        return -ENOMEM;
 
-        // u64 hole_start = d->vm_end < MMAP_AREA_START ? MMAP_AREA_START : d->vm_end;
+    /* ——— now do the one‐off “create new VMA and merge” step ——— */
+    struct vm_area *d = head;
+    while (d->vm_next && d->vm_next->vm_start < start)
+        d = d->vm_next;
 
-        if (MMAP_AREA_END - hole_start >= length_aligned) { start = hole_start; goto create; }
-    }
-    return -ENOMEM;
-
-create:
-    /* Insert new VMA */
-    d = head;
-    while (d->vm_next && d->vm_next->vm_start < start) d = d->vm_next;
     struct vm_area *vm = os_alloc(sizeof(*vm));
-    if (!vm) return -ENOMEM;
-    vm->vm_start = start;
-    vm->vm_end = start + length_aligned;
+    if (!vm)
+        return -ENOMEM;
+
+    vm->vm_start     = start;
+    vm->vm_end       = start + length_aligned;
     vm->access_flags = prot;
-    vm->vm_next = d->vm_next;
-    d->vm_next = vm;
+    vm->vm_next      = d->vm_next;
+    d->vm_next       = vm;
     stats->num_vm_area++;
 
-    /* Merge with next */
-    if (vm->vm_next && vm->vm_end == vm->vm_next->vm_start && vm->access_flags == vm->vm_next->access_flags) 
-    {
+    /* merge with next */
+    if (vm->vm_next &&
+        vm->vm_end == vm->vm_next->vm_start &&
+        vm->access_flags == vm->vm_next->access_flags) {
         struct vm_area *n = vm->vm_next;
-        vm->vm_end = n->vm_end;
-        vm->vm_next = n->vm_next;
+        vm->vm_end   = n->vm_end;
+        vm->vm_next  = n->vm_next;
         os_free(n, sizeof(*n));
         stats->num_vm_area--;
     }
-    /* Merge with d */
-    if (d != head && d->vm_end == vm->vm_start && d->access_flags == vm->access_flags) 
-    {
-        d->vm_end = vm->vm_end;
-        d->vm_next = vm->vm_next;
+    /* merge with previous */
+    if (d != head &&
+        d->vm_end == vm->vm_start &&
+        d->access_flags == vm->access_flags) {
+        d->vm_end   = vm->vm_end;
+        d->vm_next  = vm->vm_next;
         os_free(vm, sizeof(*vm));
         stats->num_vm_area--;
         start = d->vm_start;
     }
-    return (long)start;
+
+    return (long) start;
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 /**
  * munmap system call implemenations
  */
@@ -653,12 +642,12 @@ long vm_area_unmap(struct exec_context *current, u64 addr, int length)
 //}
 
 long vm_area_pagefault(struct exec_context *current, u64 addr, int error_code)
-{
+{   //printk("%d",error_code);
     if (addr < 0)
     {
         return -EINVAL;
     }
-
+    
     // find the vm_area corresponding to the faulting address
     struct vm_area *vma = current->vm_area;
     int flag = 0;
@@ -678,22 +667,17 @@ long vm_area_pagefault(struct exec_context *current, u64 addr, int error_code)
     {
         return -EINVAL;
     }
-
+    
     if (error_code == 0x6 && vma->access_flags == PROT_READ) {
+       
         return -EINVAL;
+        
     }
 
     // Another invalid fault can occur if there is a write access to a page with read only permission
     if (error_code == 0x7)
     {
-        if (vma->access_flags == PROT_READ)
-        {
-            return -EINVAL;
-        }
-        else
-        {
-            return handle_cow_fault(current, addr, vma->access_flags);
-        }
+        return -1;
     }
 
     // Manipulate Page Table
@@ -827,6 +811,7 @@ long do_cfork()
     do_file_fork(new_ctx);
     setup_child_context(new_ctx);
     return pid;
+    
 }
  
  
